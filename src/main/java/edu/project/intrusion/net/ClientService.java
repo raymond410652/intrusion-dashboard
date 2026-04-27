@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 
 import edu.project.intrusion.model.AnalysisJob;
 import edu.project.intrusion.model.AnalysisResult;
@@ -20,6 +21,7 @@ public class ClientService {
 
     private final String host;
     private final int port;
+    private final String clientInstanceId = UUID.randomUUID().toString();
 
     public ClientService(String host, int port) {
         this.host = Objects.requireNonNull(host, "host").trim();
@@ -43,7 +45,7 @@ public class ClientService {
     }
 
     public AnalysisResult analyzeCsvContent(String fileName, String csvContent) throws Exception {
-        AnalyzeRequest request = new AnalyzeRequest(fileName, csvContent);
+        AnalyzeRequest request = new AnalyzeRequest(clientInstanceId, fileName, csvContent);
 
         Object responseObject = sendRequest(request);
         if (!(responseObject instanceof AnalyzeResponse response)) {
@@ -58,7 +60,7 @@ public class ClientService {
     }
 
     public List<AnalysisJob> loadHistory() throws Exception {
-        Object responseObject = sendRequest(HistoryRequest.listHistory());
+        Object responseObject = sendRequest(HistoryRequest.listHistory(clientInstanceId));
         if (!(responseObject instanceof HistoryResponse response)) {
             throw new RuntimeException("Invalid history response from server.");
         }
@@ -71,7 +73,7 @@ public class ClientService {
     }
 
     public AnalysisResult loadAnalysisForJob(long jobId) throws Exception {
-        Object responseObject = sendRequest(HistoryRequest.analysisForJob(jobId));
+        Object responseObject = sendRequest(HistoryRequest.analysisForJob(clientInstanceId, jobId));
         if (!(responseObject instanceof HistoryResponse response)) {
             throw new RuntimeException("Invalid history response from server.");
         }
@@ -81,6 +83,21 @@ public class ClientService {
         }
 
         return response.result();
+    }
+
+    public void clearHistory() throws Exception {
+        Object responseObject = sendRequest(HistoryRequest.clearHistory(clientInstanceId));
+        if (!(responseObject instanceof HistoryResponse response)) {
+            throw new RuntimeException("Invalid history response from server.");
+        }
+
+        if (!response.success()) {
+            throw new RuntimeException(response.message());
+        }
+    }
+
+    public String clientInstanceId() {
+        return clientInstanceId;
     }
 
     private Object sendRequest(Object request) throws Exception {

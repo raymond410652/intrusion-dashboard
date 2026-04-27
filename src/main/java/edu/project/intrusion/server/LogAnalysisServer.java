@@ -5,9 +5,11 @@ import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import edu.project.intrusion.analysis.IntrusionAnalyzer;
@@ -24,6 +26,8 @@ public class LogAnalysisServer {
 
     private static final int PORT = 5060;
     private static final int MAX_CLIENTS = 10;
+    private static final AtomicInteger DASHBOARD_COUNTER = new AtomicInteger(1);
+    private static final Map<String, Integer> DASHBOARD_CLIENT_NUMBERS = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         DatabaseManager.initDatabase();
@@ -38,7 +42,6 @@ public class LogAnalysisServer {
 
             while (true) {
                 Socket clientSocket = serverSocket.accept();
-                System.out.println("Accepted client from " + clientSocket.getRemoteSocketAddress());
                 pool.submit(() -> handleClient(clientSocket));
             }
 
@@ -53,20 +56,23 @@ public class LogAnalysisServer {
              ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
 
             out.flush();
-            System.out.println("Handling client on " + Thread.currentThread().getName());
-
             Object requestObject = null;
             try {
                 requestObject = in.readObject();
+                String dashboardLabel = resolveDashboardLabel(requestObject);
                 if (requestObject instanceof AnalyzeRequest request) {
+                    System.out.println(dashboardLabel + " -> ANALYZE " + request.fileName());
                     handleAnalyzeRequest(request, out);
                 } else if (requestObject instanceof HistoryRequest request) {
+                    System.out.println(dashboardLabel + " -> " + describeHistoryRequest(request));
                     handleHistoryRequest(request, out);
                 } else {
+                    System.out.println("unknown-dashboard -> INVALID REQUEST " + requestObject);
                     out.writeObject(new AnalyzeResponse(false, "Invalid request type", null));
                 }
                 out.flush();
             } catch (Exception e) {
+                System.out.println("Server request failed: " + e.getMessage());
                 e.printStackTrace();
                 if (requestObject instanceof AnalyzeRequest) {
                     out.writeObject(new AnalyzeResponse(false, "Server error: " + e.getMessage(), null));
@@ -100,8 +106,39 @@ public class LogAnalysisServer {
             case "ANALYSIS" -> out.writeObject(
                     HistoryResponse.analysis(DatabaseManager.getAnalysisResultForJob(request.jobId()))
             );
+            case "CLEAR" -> {
+                DatabaseManager.clearAnalysisHistory();
+                out.writeObject(HistoryResponse.success("History cleared"));
+            }
             default -> out.writeObject(HistoryResponse.failure("Unknown history action: " + request.action()));
         }
+    }
+
+    private static String describeHistoryRequest(HistoryRequest request) {
+        return switch (request.action()) {
+            case "LIST" -> "HISTORY LIST";
+            case "ANALYSIS" -> "HISTORY ANALYSIS jobId=" + request.jobId();
+            case "CLEAR" -> "HISTORY CLEAR";
+            default -> "HISTORY " + request.action();
+        };
+    }
+
+    private static String resolveDashboardLabel(Object requestObject) {
+        String clientInstanceId = switch (requestObject) {
+            case AnalyzeRequest request -> request.clientInstanceId();
+            case HistoryRequest request -> request.clientInstanceId();
+            default -> null;
+        };
+
+        if (clientInstanceId == null || clientInstanceId.isBlank()) {
+            return "unknown-dashboard";
+        }
+
+        int dashboardNumber = DASHBOARD_CLIENT_NUMBERS.computeIfAbsent(
+                clientInstanceId,
+                ignored -> DASHBOARD_COUNTER.getAndIncrement()
+        );
+        return "dashboard-client-" + dashboardNumber;
     }
 
     private static ThreadFactory createThreadFactory() {

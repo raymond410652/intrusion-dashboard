@@ -1,9 +1,7 @@
 package edu.project.intrusion.ui;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystems;
@@ -13,10 +11,9 @@ import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -28,7 +25,6 @@ import edu.project.intrusion.model.AnalysisJob;
 import edu.project.intrusion.model.AnalysisResult;
 import edu.project.intrusion.model.LogEntry;
 import edu.project.intrusion.net.ClientService;
-import edu.project.intrusion.parser.CsvLogParser;
 import edu.project.intrusion.parser.TcpdumpPacketParser;
 import javafx.application.Application;
 import javafx.application.Platform;
@@ -43,6 +39,7 @@ import javafx.scene.chart.NumberAxis;
 import javafx.scene.chart.XYChart;
 import javafx.scene.control.Alert.AlertType;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonType;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressIndicator;
 import javafx.scene.control.Tab;
@@ -61,38 +58,30 @@ public class DashboardApp extends Application {
 
     private final ClientService clientService = new ClientService("localhost", 5060);
     private final ScheduledExecutorService monitorDebouncer = Executors.newSingleThreadScheduledExecutor();
-    private final AtomicBoolean monitorAnalysisRunning = new AtomicBoolean(false);
-    private final List<LogEntry> capturedEntries = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicBoolean captureAnalysisRunning = new AtomicBoolean(false);
+    private final AtomicBoolean tcpdumpAnalysisRunning = new AtomicBoolean(false);
 
     private TextField fileField;
-    private TextField monitorFileField;
+    private TextField tcpdumpFileField;
     private Label totalLabel;
     private Label failedLabel;
     private Label scanLabel;
     private Label spikeLabel;
     private Label statusLabel;
-    private Label monitorStatusLabel;
-    private Label captureStatusLabel;
+    private Label tcpdumpStatusLabel;
     private ProgressIndicator progressIndicator;
     private Button analyzeButton;
-    private Button startMonitorButton;
-    private Button stopMonitorButton;
-    private Button startCaptureButton;
-    private Button stopCaptureButton;
-    private TextField captureInterfaceField;
+    private Button startTcpdumpMonitorButton;
+    private Button stopTcpdumpMonitorButton;
     private TableView<Alert> alertTable;
     private TableView<AnalysisJob> historyTable;
     private TableView<LogEntry> liveLogTable;
     private Label liveLogCountLabel;
     private BarChart<String, Number> topIpChart;
-    private WatchService watchService;
-    private Thread monitorThread;
-    private File monitoredFile;
-    private ScheduledFuture<?> pendingMonitorAnalysis;
-    private Process captureProcess;
-    private Thread captureThread;
-    private ScheduledFuture<?> pendingCaptureAnalysis;
+    private WatchService tcpdumpWatchService;
+    private Thread tcpdumpMonitorThread;
+    private File tcpdumpFile;
+    private ScheduledFuture<?> pendingTcpdumpRefresh;
+    private int tcpdumpStartLine;
 
     @Override
     public void start(Stage stage) {
@@ -117,32 +106,6 @@ public class DashboardApp extends Application {
         HBox topBar = new HBox(10, fileField, browseButton, analyzeButton, progressIndicator);
         topBar.setAlignment(Pos.CENTER_LEFT);
         topBar.setPadding(new Insets(10));
-
-        monitorFileField = new TextField();
-        monitorFileField.setPrefWidth(450);
-        monitorFileField.setEditable(false);
-
-        Button chooseMonitorButton = new Button("Choose Monitor File");
-        startMonitorButton = new Button("Start Monitor");
-        stopMonitorButton = new Button("Stop Monitor");
-        stopMonitorButton.setDisable(true);
-
-        monitorStatusLabel = new Label("Monitor stopped.");
-
-        chooseMonitorButton.setOnAction(e -> chooseMonitorFile(stage));
-        startMonitorButton.setOnAction(e -> startMonitoring());
-        stopMonitorButton.setOnAction(e -> stopMonitoring());
-
-        HBox monitorBar = new HBox(
-                10,
-                monitorFileField,
-                chooseMonitorButton,
-                startMonitorButton,
-                stopMonitorButton,
-                monitorStatusLabel
-        );
-        monitorBar.setAlignment(Pos.CENTER_LEFT);
-        monitorBar.setPadding(new Insets(10, 10, 0, 10));
 
         totalLabel = new Label("Total Records: 0");
         failedLabel = new Label("Failed Login IPs: 0");
@@ -191,16 +154,18 @@ public class DashboardApp extends Application {
         topIpChart.setLegendVisible(false);
         topIpChart.setPrefHeight(300);
 
-        VBox dashboardBox = new VBox(15, monitorBar, statsPane, new Label("Alerts"), alertTable, topIpChart, statusLabel);
+        VBox dashboardBox = new VBox(15, statsPane, new Label("Alerts"), alertTable, topIpChart, statusLabel);
         dashboardBox.setPadding(new Insets(10));
 
         historyTable = createHistoryTable();
         Button refreshHistoryButton = new Button("Refresh History");
         Button viewAlertsButton = new Button("View Analysis");
+        Button clearHistoryButton = new Button("Clean");
         refreshHistoryButton.setOnAction(e -> loadHistory());
         viewAlertsButton.setOnAction(e -> showSelectedHistoryAnalysis());
+        clearHistoryButton.setOnAction(e -> clearHistory());
 
-        HBox historyActions = new HBox(10, refreshHistoryButton, viewAlertsButton);
+        HBox historyActions = new HBox(10, refreshHistoryButton, viewAlertsButton, clearHistoryButton);
         historyActions.setAlignment(Pos.CENTER_LEFT);
 
         VBox historyBox = new VBox(10, historyActions, historyTable);
@@ -208,27 +173,32 @@ public class DashboardApp extends Application {
 
         liveLogTable = createLiveLogTable();
         liveLogCountLabel = new Label("Live Rows: 0");
+        tcpdumpFileField = new TextField();
+        tcpdumpFileField.setPrefWidth(420);
+        tcpdumpFileField.setEditable(false);
+        Button chooseTcpdumpFileButton = new Button("Choose Tcpdump File");
+        startTcpdumpMonitorButton = new Button("Start Tcpdump Monitor");
+        stopTcpdumpMonitorButton = new Button("Stop Tcpdump Monitor");
+        Button clearLiveLogsButton = new Button("Clean");
+        stopTcpdumpMonitorButton.setDisable(true);
+        tcpdumpStatusLabel = new Label("Tcpdump monitor stopped.");
+        chooseTcpdumpFileButton.setOnAction(e -> chooseTcpdumpFile(stage));
+        startTcpdumpMonitorButton.setOnAction(e -> startTcpdumpMonitoring());
+        stopTcpdumpMonitorButton.setOnAction(e -> stopTcpdumpMonitoring());
+        clearLiveLogsButton.setOnAction(e -> clearLiveLogs());
 
-        captureInterfaceField = new TextField("en0");
-        captureInterfaceField.setPrefWidth(90);
-        startCaptureButton = new Button("Start Capture");
-        stopCaptureButton = new Button("Stop Capture");
-        stopCaptureButton.setDisable(true);
-        captureStatusLabel = new Label("Packet capture stopped.");
-        startCaptureButton.setOnAction(e -> startPacketCapture());
-        stopCaptureButton.setOnAction(e -> stopPacketCapture());
-
-        HBox captureBar = new HBox(
+        HBox tcpdumpBar = new HBox(
                 10,
-                new Label("Interface"),
-                captureInterfaceField,
-                startCaptureButton,
-                stopCaptureButton,
-                captureStatusLabel
+                tcpdumpFileField,
+                chooseTcpdumpFileButton,
+                startTcpdumpMonitorButton,
+                stopTcpdumpMonitorButton,
+                clearLiveLogsButton,
+                tcpdumpStatusLabel
         );
-        captureBar.setAlignment(Pos.CENTER_LEFT);
+        tcpdumpBar.setAlignment(Pos.CENTER_LEFT);
 
-        VBox liveLogsBox = new VBox(10, captureBar, liveLogCountLabel, liveLogTable);
+        VBox liveLogsBox = new VBox(10, tcpdumpBar, liveLogCountLabel, liveLogTable);
         liveLogsBox.setPadding(new Insets(10));
 
         TabPane tabPane = new TabPane();
@@ -262,17 +232,18 @@ public class DashboardApp extends Application {
         }
     }
 
-    private void chooseMonitorFile(Stage stage) {
+    private void chooseTcpdumpFile(Stage stage) {
         FileChooser chooser = new FileChooser();
-        chooser.setTitle("Select Log File to Monitor");
-        chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("CSV Files", "*.csv"));
+        chooser.setTitle("Select Tcpdump Output File");
+        chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("Text Files", "*.txt", "*.log"));
 
         File file = chooser.showOpenDialog(stage);
         if (file != null) {
-            monitoredFile = file;
-            monitorFileField.setText(file.getAbsolutePath());
-            monitorStatusLabel.setText("Ready to monitor: " + file.getName());
-            refreshLiveLogs();
+            tcpdumpFile = file;
+            tcpdumpStartLine = 0;
+            tcpdumpFileField.setText(file.getAbsolutePath());
+            tcpdumpStatusLabel.setText("Ready to monitor: " + file.getName());
+            refreshTcpdumpLiveLogs();
         }
     }
 
@@ -319,60 +290,59 @@ public class DashboardApp extends Application {
         thread.start();
     }
 
-    private void startMonitoring() {
-        if (monitoredFile == null) {
-            showError("Please choose a log file to monitor first.");
+    private void startTcpdumpMonitoring() {
+        if (tcpdumpFile == null) {
+            showError("Please choose a tcpdump output file first.");
             return;
         }
 
-        if (!monitoredFile.isFile() || !monitoredFile.canRead()) {
-            showError("Selected monitor file cannot be read.");
+        if (!tcpdumpFile.isFile() || !tcpdumpFile.canRead()) {
+            showError("Selected tcpdump file cannot be read.");
             return;
         }
 
-        stopMonitoring();
-
+        stopTcpdumpMonitoring();
         try {
-            watchService = FileSystems.getDefault().newWatchService();
-            Path parent = monitoredFile.toPath().getParent();
+            tcpdumpWatchService = FileSystems.getDefault().newWatchService();
+            Path parent = tcpdumpFile.toPath().getParent();
             if (parent == null) {
-                showError("Selected monitor file has no parent folder.");
+                showError("Selected tcpdump file has no parent folder.");
                 return;
             }
 
             parent.register(
-                    watchService,
+                    tcpdumpWatchService,
                     StandardWatchEventKinds.ENTRY_CREATE,
                     StandardWatchEventKinds.ENTRY_MODIFY
             );
 
-            startMonitorButton.setDisable(true);
-            stopMonitorButton.setDisable(false);
-            monitorStatusLabel.setText("Monitoring: " + monitoredFile.getName());
+            startTcpdumpMonitorButton.setDisable(true);
+            stopTcpdumpMonitorButton.setDisable(false);
+            tcpdumpStatusLabel.setText("Monitoring: " + tcpdumpFile.getName());
 
-            monitorThread = new Thread(() -> watchMonitorFile(parent), "log-file-monitor");
-            monitorThread.setDaemon(true);
-            monitorThread.start();
+            tcpdumpMonitorThread = new Thread(() -> watchTcpdumpFile(parent), "tcpdump-file-monitor");
+            tcpdumpMonitorThread.setDaemon(true);
+            tcpdumpMonitorThread.start();
 
-            analyzeMonitoredFile("Initial monitor analysis completed.");
+            refreshTcpdumpLiveLogs();
         } catch (IOException e) {
-            showError("Unable to start monitor: " + e.getMessage());
-            stopMonitoring();
+            showError("Unable to start tcpdump file monitor: " + e.getMessage());
+            stopTcpdumpMonitoring();
         }
     }
 
-    private void watchMonitorFile(Path parent) {
-        while (watchService != null) {
+    private void watchTcpdumpFile(Path parent) {
+        while (tcpdumpWatchService != null) {
             try {
-                WatchKey key = watchService.take();
+                WatchKey key = tcpdumpWatchService.take();
                 for (WatchEvent<?> event : key.pollEvents()) {
                     if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
                         continue;
                     }
 
                     Path changedPath = parent.resolve((Path) event.context());
-                    if (changedPath.equals(monitoredFile.toPath())) {
-                        scheduleMonitoredAnalysis();
+                    if (changedPath.equals(tcpdumpFile.toPath())) {
+                        scheduleTcpdumpRefresh();
                     }
                 }
 
@@ -386,235 +356,125 @@ public class DashboardApp extends Application {
                 break;
             } catch (Exception e) {
                 Platform.runLater(() -> {
-                    monitorStatusLabel.setText("Monitor stopped.");
-                    showError("Monitor failed: " + e.getMessage());
+                    tcpdumpStatusLabel.setText("Tcpdump monitor stopped.");
+                    showError("Tcpdump monitor failed: " + e.getMessage());
                 });
                 break;
             }
         }
     }
 
-    private void scheduleMonitoredAnalysis() {
-        if (pendingMonitorAnalysis != null) {
-            pendingMonitorAnalysis.cancel(false);
+    private void scheduleTcpdumpRefresh() {
+        if (pendingTcpdumpRefresh != null) {
+            pendingTcpdumpRefresh.cancel(false);
         }
 
-        pendingMonitorAnalysis = monitorDebouncer.schedule(
-                () -> Platform.runLater(() -> analyzeMonitoredFile("Monitor analysis completed after file change.")),
+        pendingTcpdumpRefresh = monitorDebouncer.schedule(
+                () -> Platform.runLater(this::refreshTcpdumpLiveLogs),
                 2,
                 TimeUnit.SECONDS
         );
     }
 
-    private void analyzeMonitoredFile(String successMessage) {
-        if (monitoredFile == null || !monitorAnalysisRunning.compareAndSet(false, true)) {
+    private void refreshTcpdumpLiveLogs() {
+        if (tcpdumpFile == null || liveLogTable == null) {
+            return;
+        }
+
+        Task<List<LogEntry>> task = new Task<>() {
+            @Override
+            protected List<LogEntry> call() throws Exception {
+                return parseTcpdumpFile(tcpdumpFile, tcpdumpStartLine);
+            }
+        };
+
+        task.setOnSucceeded(e -> {
+            List<LogEntry> entries = task.getValue();
+            setLiveRows(entries);
+            if (tcpdumpStatusLabel != null) {
+                tcpdumpStatusLabel.setText("Monitoring: " + tcpdumpFile.getName());
+            }
+            analyzeTcpdumpEntries(entries);
+        });
+
+        task.setOnFailed(e -> {
+            Throwable ex = task.getException();
+            liveLogCountLabel.setText("Live Rows: unavailable");
+            if (tcpdumpStatusLabel != null) {
+                tcpdumpStatusLabel.setText("Tcpdump monitor stopped.");
+            }
+            showError(ex == null ? "Unable to load tcpdump logs." : ex.getMessage());
+        });
+
+        Thread thread = new Thread(task, "tcpdump-log-refresh");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void analyzeTcpdumpEntries(List<LogEntry> entries) {
+        if (entries.isEmpty() || !tcpdumpAnalysisRunning.compareAndSet(false, true)) {
             return;
         }
 
         Task<AnalysisResult> task = new Task<>() {
             @Override
             protected AnalysisResult call() throws Exception {
-                return clientService.analyzeFile(monitoredFile);
+                return clientService.analyzeCsvContent("tcpdump-live-capture.csv", toCsv(entries));
             }
         };
 
         progressIndicator.visibleProperty().unbind();
         progressIndicator.visibleProperty().bind(task.runningProperty());
-        monitorStatusLabel.setText("Analyzing monitored file...");
 
         task.setOnSucceeded(e -> {
-            monitorAnalysisRunning.set(false);
-            AnalysisResult result = task.getValue();
-            updateDashboard(result);
-            refreshLiveLogs();
+            tcpdumpAnalysisRunning.set(false);
+            updateDashboard(task.getValue());
             loadHistory();
-            monitorStatusLabel.setText("Monitoring: " + monitoredFile.getName());
-            statusLabel.setText(successMessage);
+            statusLabel.setText("Tcpdump file analysis completed.");
+            if (tcpdumpStatusLabel != null && tcpdumpFile != null) {
+                tcpdumpStatusLabel.setText("Monitoring: " + tcpdumpFile.getName());
+            }
         });
 
         task.setOnFailed(e -> {
-            monitorAnalysisRunning.set(false);
+            tcpdumpAnalysisRunning.set(false);
             Throwable ex = task.getException();
-            monitorStatusLabel.setText("Monitoring: " + monitoredFile.getName());
-            showError(ex == null ? "Monitor analysis failed." : ex.getMessage());
+            showError(ex == null ? "Tcpdump analysis failed." : ex.getMessage());
         });
 
-        Thread thread = new Thread(task, "monitored-log-analysis");
+        Thread thread = new Thread(task, "tcpdump-analysis");
         thread.setDaemon(true);
         thread.start();
     }
 
-    private void stopMonitoring() {
-        if (pendingMonitorAnalysis != null) {
-            pendingMonitorAnalysis.cancel(false);
-            pendingMonitorAnalysis = null;
+    private void stopTcpdumpMonitoring() {
+        if (pendingTcpdumpRefresh != null) {
+            pendingTcpdumpRefresh.cancel(false);
+            pendingTcpdumpRefresh = null;
         }
 
-        if (watchService != null) {
+        if (tcpdumpWatchService != null) {
             try {
-                watchService.close();
+                tcpdumpWatchService.close();
             } catch (IOException ignored) {
                 // Monitor is already stopping.
             }
-            watchService = null;
+            tcpdumpWatchService = null;
         }
 
-        if (monitorThread != null) {
-            monitorThread.interrupt();
-            monitorThread = null;
+        if (tcpdumpMonitorThread != null) {
+            tcpdumpMonitorThread.interrupt();
+            tcpdumpMonitorThread = null;
         }
 
-        if (startMonitorButton != null) {
-            startMonitorButton.setDisable(false);
+        if (startTcpdumpMonitorButton != null) {
+            startTcpdumpMonitorButton.setDisable(false);
         }
-        if (stopMonitorButton != null) {
-            stopMonitorButton.setDisable(true);
+        if (stopTcpdumpMonitorButton != null) {
+            stopTcpdumpMonitorButton.setDisable(true);
         }
-        if (monitorStatusLabel != null) {
-            monitorStatusLabel.setText("Monitor stopped.");
-        }
-    }
-
-    private void startPacketCapture() {
-        String networkInterface = captureInterfaceField.getText().trim();
-        if (networkInterface.isBlank()) {
-            showError("Please enter a network interface, such as en0.");
-            return;
-        }
-
-        stopPacketCapture();
-        capturedEntries.clear();
-        setLiveRows(List.of());
-
-        try {
-            ProcessBuilder builder = new ProcessBuilder(
-                    "tcpdump",
-                    "-l",
-                    "-n",
-                    "-i",
-                    networkInterface,
-                    "ip"
-            );
-            builder.redirectErrorStream(true);
-            captureProcess = builder.start();
-            startCaptureButton.setDisable(true);
-            stopCaptureButton.setDisable(false);
-            captureStatusLabel.setText("Capturing on " + networkInterface + "...");
-
-            captureThread = new Thread(() -> readPacketCaptureOutput(networkInterface), "tcpdump-capture-reader");
-            captureThread.setDaemon(true);
-            captureThread.start();
-        } catch (IOException e) {
-            stopPacketCapture();
-            showError("Unable to start tcpdump. On macOS this may require running Eclipse with packet capture permission. "
-                    + e.getMessage());
-        }
-    }
-
-    private void readPacketCaptureOutput(String networkInterface) {
-        TcpdumpPacketParser parser = new TcpdumpPacketParser();
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                captureProcess.getInputStream(),
-                StandardCharsets.UTF_8
-        ))) {
-            String line;
-            while ((line = reader.readLine()) != null && captureProcess != null) {
-                String outputLine = line;
-                parser.parse(outputLine).ifPresent(entry -> {
-                    capturedEntries.add(entry);
-                    Platform.runLater(() -> {
-                        setLiveRows(List.copyOf(capturedEntries));
-                        captureStatusLabel.setText("Capturing on " + networkInterface
-                                + " (" + capturedEntries.size() + " packets)");
-                    });
-                    scheduleCaptureAnalysis();
-                });
-
-                if (outputLine.toLowerCase().contains("permission denied")
-                        || outputLine.toLowerCase().contains("you don't have permission")) {
-                    Platform.runLater(() -> showError(outputLine));
-                }
-            }
-        } catch (IOException e) {
-            if (captureProcess != null) {
-                Platform.runLater(() -> showError("Packet capture stopped: " + e.getMessage()));
-            }
-        } finally {
-            Platform.runLater(this::stopPacketCapture);
-        }
-    }
-
-    private void scheduleCaptureAnalysis() {
-        if (pendingCaptureAnalysis != null) {
-            pendingCaptureAnalysis.cancel(false);
-        }
-
-        pendingCaptureAnalysis = monitorDebouncer.schedule(
-                () -> Platform.runLater(this::analyzeCapturedPackets),
-                3,
-                TimeUnit.SECONDS
-        );
-    }
-
-    private void analyzeCapturedPackets() {
-        List<LogEntry> snapshot = List.copyOf(capturedEntries);
-        if (snapshot.isEmpty() || !captureAnalysisRunning.compareAndSet(false, true)) {
-            return;
-        }
-
-        Task<AnalysisResult> task = new Task<>() {
-            @Override
-            protected AnalysisResult call() throws Exception {
-                return clientService.analyzeCsvContent("tcpdump-live-capture.csv", toCsv(snapshot));
-            }
-        };
-
-        progressIndicator.visibleProperty().unbind();
-        progressIndicator.visibleProperty().bind(task.runningProperty());
-
-        task.setOnSucceeded(e -> {
-            captureAnalysisRunning.set(false);
-            updateDashboard(task.getValue());
-            loadHistory();
-            statusLabel.setText("Live packet capture analysis completed.");
-        });
-
-        task.setOnFailed(e -> {
-            captureAnalysisRunning.set(false);
-            Throwable ex = task.getException();
-            showError(ex == null ? "Live packet capture analysis failed." : ex.getMessage());
-        });
-
-        Thread thread = new Thread(task, "packet-capture-analysis");
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private void stopPacketCapture() {
-        if (pendingCaptureAnalysis != null) {
-            pendingCaptureAnalysis.cancel(false);
-            pendingCaptureAnalysis = null;
-        }
-
-        if (captureProcess != null) {
-            captureProcess.destroy();
-            captureProcess = null;
-        }
-
-        if (captureThread != null) {
-            captureThread.interrupt();
-            captureThread = null;
-        }
-
-        if (startCaptureButton != null) {
-            startCaptureButton.setDisable(false);
-        }
-        if (stopCaptureButton != null) {
-            stopCaptureButton.setDisable(true);
-        }
-        if (captureStatusLabel != null) {
-            captureStatusLabel.setText("Packet capture stopped.");
+        if (tcpdumpStatusLabel != null) {
+            tcpdumpStatusLabel.setText("Tcpdump monitor stopped.");
         }
     }
 
@@ -725,41 +585,21 @@ public class DashboardApp extends Application {
         return table;
     }
 
-    private void refreshLiveLogs() {
-        if (monitoredFile == null || liveLogTable == null) {
-            return;
-        }
-
-        Task<List<LogEntry>> task = new Task<>() {
-            @Override
-            protected List<LogEntry> call() throws Exception {
-                String csvContent = Files.readString(monitoredFile.toPath(), StandardCharsets.UTF_8);
-                return new CsvLogParser().parse(csvContent);
-            }
-        };
-
-        task.setOnSucceeded(e -> {
-            List<LogEntry> entries = task.getValue();
-            setLiveRows(entries);
-        });
-
-        task.setOnFailed(e -> {
-            Throwable ex = task.getException();
-            liveLogCountLabel.setText("Live Rows: unavailable");
-            showError(ex == null ? "Unable to load live logs." : ex.getMessage());
-        });
-
-        Thread thread = new Thread(task, "live-log-table-refresh");
-        thread.setDaemon(true);
-        thread.start();
-    }
-
     private void setLiveRows(List<LogEntry> entries) {
         liveLogTable.getItems().setAll(entries);
         liveLogCountLabel.setText("Live Rows: " + entries.size());
         if (!entries.isEmpty()) {
             liveLogTable.scrollTo(entries.size() - 1);
         }
+    }
+
+    private List<LogEntry> parseTcpdumpFile(File file, int startLine) throws IOException {
+        TcpdumpPacketParser parser = new TcpdumpPacketParser();
+        return Files.readAllLines(file.toPath(), StandardCharsets.UTF_8).stream()
+                .skip(Math.max(0, startLine))
+                .map(parser::parse)
+                .flatMap(Optional::stream)
+                .toList();
     }
 
     private String toCsv(List<LogEntry> entries) {
@@ -799,6 +639,35 @@ public class DashboardApp extends Application {
         thread.start();
     }
 
+    private void clearHistory() {
+        if (!confirm("Clear saved history?", "This will remove all saved analysis history from the database.")) {
+            return;
+        }
+
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() throws Exception {
+                clientService.clearHistory();
+                return null;
+            }
+        };
+
+        task.setOnSucceeded(e -> {
+            historyTable.getItems().clear();
+            resetDashboard();
+            statusLabel.setText("History database cleared.");
+        });
+
+        task.setOnFailed(e -> {
+            Throwable ex = task.getException();
+            showError(ex == null ? "Unable to clear history." : ex.getMessage());
+        });
+
+        Thread thread = new Thread(task, "history-clear");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
     private void showSelectedHistoryAnalysis() {
         AnalysisJob selectedJob = historyTable.getSelectionModel().getSelectedItem();
         if (selectedJob == null) {
@@ -830,6 +699,41 @@ public class DashboardApp extends Application {
         thread.start();
     }
 
+    private void clearLiveLogs() {
+        if (tcpdumpFile == null) {
+            setLiveRows(List.of());
+            liveLogTable.setPlaceholder(new Label("Choose and start monitoring a tcpdump file."));
+            tcpdumpStatusLabel.setText("Live log view cleared.");
+            return;
+        }
+
+        try {
+            tcpdumpStartLine = Files.readAllLines(tcpdumpFile.toPath(), StandardCharsets.UTF_8).size();
+            setLiveRows(List.of());
+            tcpdumpStatusLabel.setText("Cleared previous live logs. Waiting for new packets...");
+        } catch (IOException e) {
+            showError("Unable to clear live logs: " + e.getMessage());
+        }
+    }
+
+    private void resetDashboard() {
+        totalLabel.setText("Total Records: 0");
+        failedLabel.setText("Failed Login IPs: 0");
+        scanLabel.setText("Port Scan IPs: 0");
+        spikeLabel.setText("Traffic Spike Minutes: 0");
+        alertTable.getItems().clear();
+        topIpChart.getData().clear();
+    }
+
+    private boolean confirm(String title, String message) {
+        javafx.scene.control.Alert alert =
+                new javafx.scene.control.Alert(AlertType.CONFIRMATION);
+        alert.setTitle(title);
+        alert.setHeaderText(title);
+        alert.setContentText(message);
+        return alert.showAndWait().filter(ButtonType.OK::equals).isPresent();
+    }
+
     private void showError(String message) {
         javafx.scene.control.Alert alert =
                 new javafx.scene.control.Alert(AlertType.ERROR);
@@ -841,8 +745,7 @@ public class DashboardApp extends Application {
 
     @Override
     public void stop() {
-        stopMonitoring();
-        stopPacketCapture();
+        stopTcpdumpMonitoring();
         monitorDebouncer.shutdownNow();
     }
 

@@ -275,6 +275,26 @@ public class DatabaseManager {
         );
     }
 
+    public static void clearAnalysisHistory() {
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+            conn.setAutoCommit(false);
+            try {
+                stmt.executeUpdate("DELETE FROM alerts");
+                stmt.executeUpdate("DELETE FROM log_events");
+                stmt.executeUpdate("DELETE FROM analysis_jobs");
+                stmt.executeUpdate("DELETE FROM sqlite_sequence WHERE name IN ('alerts', 'log_events', 'analysis_jobs')");
+                conn.commit();
+                System.out.println("Analysis history cleared.");
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Clearing analysis history failed", e);
+        }
+    }
+
     private static AnalysisJob getAnalysisJob(long jobId) {
         String query = """
                 SELECT id, file_name, total_records, suspicious_records, created_at

@@ -27,6 +27,10 @@ public record HistoryResponse(
         return new HistoryResponse(true, "Analysis loaded", List.of(), result);
     }
 
+    public static HistoryResponse success(String message) {
+        return new HistoryResponse(true, message, List.of(), null);
+    }
+
     public static HistoryResponse failure(String message) {
         return new HistoryResponse(false, message, List.of(), null);
     }
